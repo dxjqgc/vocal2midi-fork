@@ -1,0 +1,55 @@
+# Vocal2Midi (vendored subset) — keep source + runtime libs, exclude weights
+#
+# Vendored from /mnt/d/Project/OpenSourceProject/Vocal2Midi (independent git
+# repo there, history NOT carried over). Only the parts the V2M micro-service
+# actually uses were migrated:
+#   - inference/ + application/ code (qwen3asr_dml/bin keeps Linux .so only)
+#   - experiments/{1218_hfa_model_new_dict, GAME-1.0.3-medium-onnx,
+#     Qwen3-ASR-1.7B-dml} model dirs
+# Excluded on purpose: .git history, RMVPE/romajiASR models, GUI/, *.bat,
+# model-simplify.onnx, __pycache__, Windows dlls.
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== Model weights (large, not committed — same policy as source repo) =====
+*.onnx
+*.gguf
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.h5
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# NOTE: inference/qwen3asr_dml/bin/*.so ARE committed — they are the llama.cpp
+# runtime the ASR worker dlopen()s at startup, part of the code not weights.
+# The global *.so ignore from the source repo is deliberately NOT kept.
+
+# ===== Audio / media =====
+*.wav
+*.mp3
+*.flac
+
+# ===== Env / secrets =====
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ===== Editors / OS =====
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

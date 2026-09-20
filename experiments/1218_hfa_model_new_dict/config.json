@@ -1,0 +1,19 @@
+{
+    "hubert_config": {
+        "encoder": "cn_hubert",
+        "model_path": "dependencies/chinese-hubert-base",
+        "sample_rate": 16000,
+        "hop_size": 320,
+        "channel": 768
+    },
+    "mel_spec_config": {
+        "n_mels": 128,
+        "sample_rate": 44100,
+        "window_size": 882,
+        "hop_size": 441,
+        "n_fft": 1764,
+        "f_min": 40,
+        "f_max": 16000,
+        "clamp": 1e-05
+    }
+}
