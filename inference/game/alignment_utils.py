@@ -152,12 +152,41 @@ def align_notes_to_words(
             note_idx += 1
 
         if apply_word_uv and word_vuv[word_idx] == 0:
-            # Preserve unvoiced spans as a single rest word after boundary snapping.
-            new_note_seq.append("rest")
-            new_note_dur.append(end - start)
-            note_slur.append(0)
-            while note_idx < len(note_end) and note_end[note_idx] <= end + _ALIGN_MIN_GAP:
+            # Unvoiced span (consonant leak / breath). The word timeline keeps
+            # rests, but GAME notes falling inside are NOT discarded: pass them
+            # through so real onsets inside the leak zone survive. Downstream
+            # lyric assignment leaves them as '-' and the backend merges them
+            # into neighbors as needed.
+            while note_idx < len(note_end) and note_end[note_idx] <= start + _ALIGN_MIN_GAP:
                 note_idx += 1
+            cursor = start
+            emitted_any = False
+            while note_idx < len(note_seq) and note_start[note_idx] < end - _ALIGN_MIN_GAP:
+                seg_start = max(start, float(note_start[note_idx]))
+                seg_end = min(end, float(note_end[note_idx]))
+                seg_dur = seg_end - seg_start
+                if seg_dur > _ALIGN_MIN_GAP:
+                    if seg_start - cursor > _ALIGN_MIN_GAP:
+                        new_note_seq.append("rest")
+                        new_note_dur.append(seg_start - cursor)
+                        note_slur.append(0)
+                    new_note_seq.append(note_seq[note_idx])
+                    new_note_dur.append(seg_dur)
+                    note_slur.append(0)
+                    emitted_any = True
+                    cursor = seg_end
+                if note_end[note_idx] <= end + _ALIGN_MIN_GAP:
+                    note_idx += 1
+                else:
+                    break
+            if not emitted_any:
+                new_note_seq.append("rest")
+                new_note_dur.append(end - start)
+                note_slur.append(0)
+            elif end - cursor > _ALIGN_MIN_GAP:
+                new_note_seq.append("rest")
+                new_note_dur.append(end - cursor)
+                note_slur.append(0)
             continue
 
         word_note_seq = []

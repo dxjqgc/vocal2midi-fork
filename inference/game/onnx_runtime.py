@@ -67,6 +67,62 @@ class GameOnnxModel:
         language: int = 0,
         ts: list[float] | None = None,
     ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        try:
+            return self._infer_batch_once(
+                waveforms=waveforms,
+                durations=durations,
+                known_durations=known_durations,
+                boundary_threshold=boundary_threshold,
+                boundary_radius=boundary_radius,
+                score_threshold=score_threshold,
+                language=language,
+                ts=ts,
+            )
+        except Exception as batch_exc:
+            # Batched inference can fail intermittently on mixed-shape batches
+            # (e.g. estimator ReduceSum on an empty note axis when a padded
+            # item yields no boundaries). Losing the WHOLE song's pitches to a
+            # one-off ONNX failure is unacceptable — retry each item alone and
+            # skip only the items that still fail.
+            print(f"[GAME ONNX] batch inference failed ({batch_exc}); retrying items individually")
+            results = []
+            for idx in range(int(waveforms.shape[0])):
+                try:
+                    single = self._infer_batch_once(
+                        waveforms=waveforms[idx : idx + 1],
+                        durations=durations[idx : idx + 1],
+                        known_durations=(
+                            known_durations[idx : idx + 1]
+                            if known_durations is not None else None
+                        ),
+                        boundary_threshold=boundary_threshold,
+                        boundary_radius=boundary_radius,
+                        score_threshold=score_threshold,
+                        language=language,
+                        ts=ts,
+                    )
+                    results.append(single[0])
+                except Exception as item_exc:
+                    print(f"[GAME ONNX] item {idx} failed individually; skipping ({item_exc})")
+                    results.append(
+                        (np.zeros(0, dtype=np.float32),
+                         np.zeros(0, dtype=np.float32),
+                         np.zeros(0, dtype=np.float32))
+                    )
+            return results
+
+    def _infer_batch_once(
+        self,
+        *,
+        waveforms: np.ndarray,
+        durations: np.ndarray,
+        known_durations: np.ndarray | None,
+        boundary_threshold: float,
+        boundary_radius: int,
+        score_threshold: float,
+        language: int = 0,
+        ts: list[float] | None = None,
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         ts = list(ts or [])
         batch_size = int(waveforms.shape[0])
 

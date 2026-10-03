@@ -9,9 +9,40 @@ _HFA_REPAIR_RATIO = 0.6
 _HFA_REPAIR_MIN_GLOBAL_K = 3
 _HFA_REPAIR_GLOBAL_PORTION = 0.15
 
+# Crushed-syllable run redistribution (root-cause fix for leak-noise
+# absorption): a run of >= 2 consecutive lexical words crushed below
+# _HFA_CRUSHED_MAX_SEC whose preceding anchor is inflated gets the span
+# [anchor.start, next normal word start] evenly redistributed.
+_HFA_CRUSHED_MAX_SEC = 0.06
+_HFA_CRUSHED_MIN_RUN = 2
+_HFA_REDISTRIBUTE_MIN_SHARE_SEC = 0.07
+_HFA_REDISTRIBUTE_ANCHOR_RATIO = 2.0
+# False-positive guard: every run member must be MUCH shorter than the even
+# share it would receive. Genuine fast syllables (e.g. staccato 是) sit near
+# the even share already; leak-noise-crushed words are 5-10x below it.
+_HFA_CRUSHED_RECOVERY_RATIO = 0.5
+
 
 def _is_lexical_word(word) -> bool:
     return getattr(word, "text", None) not in _HFA_REPAIR_IGNORE_TOKENS
+
+
+def _word_duration(word) -> float:
+    return max(0.0, word.end - word.start)
+
+
+def _rescale_word_times(word, new_start: float, new_end: float) -> None:
+    """Remap word and phoneme boundaries linearly onto [new_start, new_end]."""
+    old_start = word.start
+    old_span = max(1e-9, word.end - old_start)
+    scale = (new_end - new_start) / old_span
+    word.start = new_start
+    word.end = new_end
+    for phoneme in word.phonemes:
+        p_start = new_start + (phoneme.start - old_start) * scale
+        p_end = new_start + (phoneme.end - old_start) * scale
+        phoneme.start = min(max(p_start, new_start), new_end)
+        phoneme.end = min(max(p_end, new_start), new_end)
 
 
 def _repair_short_word_boundaries(words) -> list[str]:
@@ -80,6 +111,94 @@ def _repair_short_word_boundaries(words) -> list[str]:
     return repair_logs
 
 
+def _redistribute_crushed_runs(words) -> list[str]:
+    """Redistribute anchor + crushed-syllable runs (leak-noise absorption).
+
+    When residual accompaniment noise precedes the first sung character, HFA
+    absorbs it into the leading word's initial consonant (e.g. /w/ stretched
+    to ~1.1s) and time-conservation crushes the following back-to-back words
+    to tens of milliseconds. The existing single-word repair cannot fire
+    here: its `next_word.start > cur_word.end` guard requires a gap, but
+    crushed words are seamless by construction.
+
+    Detection mirrors the GuitarSheetGenerator backend's proven repair
+    (v2m_melody_service Pass 1): a run of >= 2 consecutive lexical words
+    shorter than _HFA_CRUSHED_MAX_SEC whose preceding anchor is inflated
+    (>= _HFA_REDISTRIBUTE_ANCHOR_RATIO x even share) gets the span
+    [anchor.start, first normal word after the run] evenly split between
+    anchor + run members. HFA word boundaries are seamless, so the span is
+    time-conserving and an even split falls within one sixteenth note of the
+    true rhythm.
+    """
+    lexical_indices = [idx for idx, word in enumerate(words) if _is_lexical_word(word)]
+    if len(lexical_indices) < 3:
+        return []
+
+    repair_logs = []
+    pos = 0
+    while pos < len(lexical_indices):
+        idx = lexical_indices[pos]
+        if _word_duration(words[idx]) >= _HFA_CRUSHED_MAX_SEC:
+            pos += 1
+            continue
+
+        # grow a run of consecutive crushed lexical words (seamless by
+        # construction, but tolerate up to 1ms of float drift)
+        run_end = pos
+        while run_end + 1 < len(lexical_indices):
+            nxt_idx = lexical_indices[run_end + 1]
+            cur_word = words[lexical_indices[run_end]]
+            nxt_word = words[nxt_idx]
+            if (_word_duration(nxt_word) >= _HFA_CRUSHED_MAX_SEC
+                    or nxt_word.start - cur_word.end > 0.001):
+                break
+            run_end += 1
+        if run_end - pos + 1 < _HFA_CRUSHED_MIN_RUN:
+            pos = run_end + 1
+            continue
+
+        run_indices = lexical_indices[pos:run_end + 1]
+        if pos == 0:
+            pos = run_end + 1
+            continue  # no anchor before the run
+        anchor_idx = lexical_indices[pos - 1]
+        anchor = words[anchor_idx]
+
+        after_idx = lexical_indices[run_end + 1] if run_end + 1 < len(lexical_indices) else None
+        span_start = anchor.start
+        span_end = words[after_idx].start if after_idx is not None else words[run_indices[-1]].end
+
+        members = [anchor_idx] + run_indices
+        share = (span_end - span_start) / len(members)
+        if share < _HFA_REDISTRIBUTE_MIN_SHARE_SEC:
+            pos = run_end + 1
+            continue  # span itself is tiny — not an inflated-anchor case
+        if _word_duration(anchor) < share * _HFA_REDISTRIBUTE_ANCHOR_RATIO:
+            pos = run_end + 1
+            continue  # anchor not inflated — shorts may be genuine fast syllables
+        if any(_word_duration(words[i]) >= share * _HFA_CRUSHED_RECOVERY_RATIO
+               for i in run_indices):
+            pos = run_end + 1
+            continue  # a run member already holds a fair share — genuine fast
+                      # syllables, not leak-noise crushing
+
+        cursor = span_start
+        for member_idx in members:
+            word = words[member_idx]
+            _rescale_word_times(word, cursor, cursor + share)
+            cursor += share
+
+        crushed_texts = [words[i].text for i in run_indices]
+        repair_logs.append(
+            f"[HFA Repair] crushed-run redistributed: anchor '{anchor.text}' "
+            f"(dur {_word_duration(anchor):.3f}s) + {crushed_texts} -> "
+            f"{len(members)} x {share:.3f}s over [{span_start:.3f}s, {span_end:.3f}s]"
+        )
+        pos = run_end + 1
+
+    return repair_logs
+
+
 def _repair_pred_dict_short_words(pred_dict) -> None:
     total_repaired = 0
     for stem, pred in pred_dict.items():
@@ -87,6 +206,10 @@ def _repair_pred_dict_short_words(pred_dict) -> None:
             continue
         words = pred[2]
         repair_logs = _repair_short_word_boundaries(words)
+        # run the root-cause redistribution after the single-word repair so
+        # genuine short words separated by silence are already fixed and the
+        # crushed-run detector sees a cleaner sequence
+        repair_logs += _redistribute_crushed_runs(words)
         if repair_logs:
             print(f"[HFA Repair] {stem}: repaired {len(repair_logs)} short word(s)")
             for log in repair_logs:
@@ -95,6 +218,7 @@ def _repair_pred_dict_short_words(pred_dict) -> None:
 
     if total_repaired > 0:
         print(f"[HFA Repair] Total repaired short words: {total_repaired}")
+
 
 def load_hfa_model(model_dir, device="dml"):
     """

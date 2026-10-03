@@ -152,10 +152,24 @@ def _merge_short_segments(chunks: list, sr: int, min_len_sec: float, max_len_sec
     return merged
 
 
-def _merge_tiny_chunks(chunks: list, sr: int, tiny_sec: float = 0.35) -> list:
-    """Merge tiny chunks into adjacent chunks instead of discarding them."""
+def _merge_tiny_chunks(chunks: list, sr: int, tiny_sec: float = 0.35,
+                       max_len_sec: float | None = None) -> list:
+    """Merge tiny chunks into adjacent chunks instead of discarding them.
+
+    When max_len_sec is set, a merge is skipped if the combined duration
+    (including any materialized inter-segment silence) would exceed the cap:
+    merging a 0.2s leak-noise blip into the previous chunk materializes the
+    whole gap between them, which has produced 14~20s chunks from a <=10s
+    cap. Over-cap tiny segments are kept standalone instead — they yield no
+    ASR text and get skipped during lyric alignment.
+    """
     if not chunks:
         return chunks
+
+    def _fits(left, right):
+        if max_len_sec is None:
+            return True
+        return _merged_duration_sec(left, right, sr) <= max_len_sec
 
     merged = []
     pending_head = None
@@ -164,9 +178,12 @@ def _merge_tiny_chunks(chunks: list, sr: int, tiny_sec: float = 0.35) -> list:
         seg_dur = len(seg['waveform']) / sr
 
         if seg_dur < tiny_sec:
-            if merged:
+            if merged and _fits(merged[-1], seg):
                 print(f"  Merging tiny segment at {seg['offset']:.2f}s ({seg_dur:.2f}s) into previous chunk")
                 merged[-1] = _merge_segments(merged[-1], seg, sr)
+            elif merged:
+                print(f"  Keeping tiny segment at {seg['offset']:.2f}s ({seg_dur:.2f}s) standalone: merge would exceed {max_len_sec:.1f}s cap")
+                merged.append(seg)
             else:
                 if pending_head is None:
                     pending_head = seg
@@ -175,10 +192,15 @@ def _merge_tiny_chunks(chunks: list, sr: int, tiny_sec: float = 0.35) -> list:
             continue
 
         if pending_head is not None:
-            pdur = len(pending_head['waveform']) / sr
-            print(f"  Merging leading tiny segment at {pending_head['offset']:.2f}s ({pdur:.2f}s) into next chunk")
-            seg = _merge_segments(pending_head, seg, sr)
-            pending_head = None
+            if _fits(pending_head, seg):
+                pdur = len(pending_head['waveform']) / sr
+                print(f"  Merging leading tiny segment at {pending_head['offset']:.2f}s ({pdur:.2f}s) into next chunk")
+                seg = _merge_segments(pending_head, seg, sr)
+                pending_head = None
+            else:
+                print(f"  Keeping leading tiny segment at {pending_head['offset']:.2f}s standalone: merge would exceed {max_len_sec:.1f}s cap")
+                merged.append(pending_head)
+                pending_head = None
 
         merged.append(seg)
 
@@ -188,6 +210,36 @@ def _merge_tiny_chunks(chunks: list, sr: int, tiny_sec: float = 0.35) -> list:
         merged.append(pending_head)
 
     return merged
+
+
+def _enforce_max_len(chunks: list, sr: int, max_len_sec: float) -> list:
+    """Hard cap on final chunk duration.
+
+    Sub-splits any chunk still over max_len_sec at local energy minima
+    (using the same sliding-window splitter as heuristic mode). This is the
+    last-resort guarantee for callers that pass explicit bounds — e.g. the
+    V2M webapp caps chunks at 10s so Qwen3-ASR's attention stays bounded.
+    """
+    out = []
+    for chunk in chunks:
+        dur = _segment_duration_sec(chunk, sr)
+        if dur <= max_len_sec + 0.5:
+            out.append(chunk)
+            continue
+        print(f"  Enforcing max length: re-splitting {dur:.2f}s chunk at {chunk['offset']:.2f}s (cap {max_len_sec:.1f}s)")
+        subs = _sliding_window_split(
+            chunk['waveform'], sr,
+            min_len_sec=max(2.0, max_len_sec / 2),
+            max_len_sec=max_len_sec,
+            target_threshold_db=-30.0,
+            frame_length=2048,
+            hop_length=512,
+        )
+        for sub in subs:
+            sub['offset'] += chunk['offset']
+            out.append(sub)
+    out.sort(key=lambda c: c['offset'])
+    return out
 
 def get_pitch_curve(
     y: np.ndarray,
@@ -430,7 +482,7 @@ def heuristic_slice(
              final_chunks.append(segment)
 
     final_chunks.sort(key=lambda x: x['offset'])
-    final_chunks = _merge_tiny_chunks(final_chunks, sr=sr, tiny_sec=ultra_short_sec)
+    final_chunks = _merge_tiny_chunks(final_chunks, sr=sr, tiny_sec=ultra_short_sec, max_len_sec=max_len_sec)
 
     # Stage 3: merge neighboring short segments toward the target duration range.
     if final_chunks:
@@ -630,7 +682,7 @@ def pitch_based_slice(
     else:
         final_chunks = short_segments
 
-    final_chunks = _merge_tiny_chunks(final_chunks, sr=sr, tiny_sec=ultra_short_sec)
+    final_chunks = _merge_tiny_chunks(final_chunks, sr=sr, tiny_sec=ultra_short_sec, max_len_sec=max_len_sec)
 
     # Stage 3: merge neighboring short segments toward the target duration range.
     if final_chunks:
@@ -776,7 +828,7 @@ def slice_audio_with_custom_bounds(
         globals()["pitch_based_slice"] = _pitch_based_slice_with_bounds
         globals()["heuristic_slice"] = _heuristic_slice_with_bounds
         globals()["grid_search_slice"] = _grid_search_slice_with_bounds
-        return slice_audio(
+        chunks = slice_audio(
             waveform,
             sr,
             method,
@@ -787,3 +839,13 @@ def slice_audio_with_custom_bounds(
         globals()["pitch_based_slice"] = original_pitch_based_slice
         globals()["heuristic_slice"] = original_heuristic_slice
         globals()["grid_search_slice"] = original_grid_search_slice
+
+    # Last-resort hard cap for ALL methods (default included): re-split any
+    # chunk still over the cap at local energy minima. Callers pass explicit
+    # bounds for a reason — e.g. V2M caps chunks at 10s to keep Qwen3-ASR
+    # attention bounded (a 94s chunk once tried to allocate 11GB).
+    if chunks and any(_segment_duration_sec(c, sr) > resolved_max_sec + 0.5
+                      for c in chunks):
+        print(f"Post-slice max-length enforcement (cap {resolved_max_sec:.1f}s)...")
+        chunks = _enforce_max_len(chunks, sr, resolved_max_sec)
+    return chunks
