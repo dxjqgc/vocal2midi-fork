@@ -263,9 +263,12 @@ def _asr_worker_main(model_path, device, task_queue, result_queue):
     model = None
     try:
         proc_name = mp.current_process().name
-        print(f"Initializing ASR worker ({proc_name}) with model '{model_path}' on {device}...")
+        # ★ 本仓库新增 flush：worker 是 spawn 子进程，stdout 被块缓冲时这几行要等
+        #   进程结束才可见 —— 卡在模型加载时日志上就完全看不到进度。
+        print(f"Initializing ASR worker ({proc_name}) with model '{model_path}' on {device}...",
+              flush=True)
         model = load_qwen_model(model_path, device, use_cache=False)
-        print(f"ASR worker ({proc_name}) initialized.")
+        print(f"ASR worker ({proc_name}) initialized.", flush=True)
         result_queue.put({"type": "ready"})
 
         while True:
@@ -367,7 +370,8 @@ def batch_transcribe_asr(
 ):
     """Saves chunks to temp_dir and runs batched ASR transcription."""
     asr_lang = "Japanese" if language == "ja" else "Chinese"
-    print(f"[ASR API] Running ASR with Qwen DML+CPU runtime (Batch Size: {asr_batch_size}, Language: {asr_lang})...")
+    print(f"[ASR API] Running ASR with Qwen DML+CPU runtime (Batch Size: {asr_batch_size}, Language: {asr_lang})...",
+          flush=True)
 
     audio_paths = []
     chunk_indices = []
@@ -399,13 +403,29 @@ def batch_transcribe_asr(
         )
         worker.start()
         try:
-            startup_message = _wait_for_worker_message(
-                result_queue,
-                worker,
-                timeout_sec=asr_timeout_sec,
-                cancel_checker=cancel_checker,
-                on_cancel=lambda: _shutdown_asr_worker(worker, task_queue, terminate=True),
-            )
+            # ★ 本仓库新增：worker 启动等待原来**没有**超时处理，_wait_for_worker_message
+            #   到点抛的是 `mp.TimeoutError`（消息为空），一路冒到调用方就只剩
+            #   "TimeoutError: " —— 分不清是「模型加载慢」还是「worker 崩了」。
+            #   这里补一条能自解释的报错（含时限与当前已耗时），并顺手把 worker 收掉。
+            _startup_t0 = time.perf_counter()
+            try:
+                startup_message = _wait_for_worker_message(
+                    result_queue,
+                    worker,
+                    timeout_sec=asr_timeout_sec,
+                    cancel_checker=cancel_checker,
+                    on_cancel=lambda: _shutdown_asr_worker(worker, task_queue, terminate=True),
+                )
+            except mp.TimeoutError:
+                elapsed = time.perf_counter() - _startup_t0
+                _shutdown_asr_worker(worker, task_queue, terminate=True)
+                raise TimeoutError(
+                    f"ASR worker startup timed out after {elapsed:.1f}s "
+                    f"(limit {asr_timeout_sec}s, model={asr_model_path!r}, device={device!r}, "
+                    f"worker_alive={worker.is_alive()}). "
+                    "This usually means the Qwen ASR model is slow to load in the spawned "
+                    "subprocess; raise V2M_ASR_TIMEOUT_SEC (or lower the load) and retry."
+                ) from None
             if startup_message.get("type") == "startup_error":
                 raise RuntimeError(f"ASR worker failed to start: {startup_message.get('error', 'unknown error')}")
             if startup_message.get("type") != "ready":

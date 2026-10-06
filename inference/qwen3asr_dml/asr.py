@@ -2,7 +2,9 @@
 import codecs
 import dataclasses
 import multiprocessing as mp
+import os
 from pathlib import Path
+import queue
 import re
 import time
 from collections import deque
@@ -14,6 +16,62 @@ from . import llama
 from .asr_worker import asr_helper_worker_proc
 from .schema import ASREngineConfig, DecodeResult, MsgType, StreamingMessage, TranscribeResult
 from .utils import normalize_language_name, validate_language
+
+
+
+# ★ 本仓库新增 ────────────────────────────────────────────────────────────
+# ASR helper 子进程的 stdout/stderr **直接落盘**。
+# 为什么必须抓：hhelper 崩在原生层（段错误/abort/被信号杀）时只写 fd 2，不经过
+# Python、也没有 traceback —— 不抓的话它就是"一声不响地死掉"，父进程只能干等
+# （实测就是这么被拖到外层 600s 超时的）。所以这里用 os.dup2 重定向 **文件描述符**
+# （不是 sys.stderr，那样抓不到 C 层输出），默认写到 /tmp/v2m_asr_helper.log，
+# 可用 V2M_ASR_HELPER_LOG 覆盖。
+_HELPER_LOG_DEFAULT = "/tmp/v2m_asr_helper.log"
+_HELPER_READY_TIMEOUT_DEFAULT = 600.0
+
+
+def helper_log_path() -> str:
+    return os.environ.get("V2M_ASR_HELPER_LOG", _HELPER_LOG_DEFAULT)
+
+
+def helper_ready_timeout_sec() -> float:
+    try:
+        return float(os.environ.get("V2M_ASR_HELPER_READY_TIMEOUT",
+                                    _HELPER_READY_TIMEOUT_DEFAULT))
+    except (TypeError, ValueError):
+        return _HELPER_READY_TIMEOUT_DEFAULT
+
+
+def _helper_log_tail(max_lines: int = 30) -> str:
+    """helper 日志的最后若干行（附带错误一起抛给调用方，让 /status 里能直接看到）。"""
+    try:
+        with open(helper_log_path(), "r", errors="replace") as fh:
+            return "".join(fh.readlines()[-max_lines:])
+    except Exception as exc:  # noqa: BLE001
+        return f"(读不到 helper 日志 {helper_log_path()}: {exc})"
+
+
+def _asr_helper_worker_proc_logged(to_worker_q, from_enc_q, config):
+    """重定向 fd 1/2 到日志后再跑真正的 helper（见上面注释）。"""
+    import sys
+    try:
+        fd = os.open(helper_log_path(), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        if fd > 2:
+            os.close(fd)
+        sys.stdout = os.fdopen(1, "w", buffering=1)
+        sys.stderr = os.fdopen(2, "w", buffering=1)
+    except Exception:  # noqa: BLE001  抓不到日志也不能不干活
+        pass
+    print(f"\n===== ASR helper start pid={os.getpid()} "
+          f"model={getattr(config, 'model_dir', '?')} =====", flush=True)
+    try:
+        return asr_helper_worker_proc(to_worker_q, from_enc_q, config)
+    except BaseException:
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 @dataclasses.dataclass
@@ -35,7 +93,7 @@ class QwenASREngine:
         self.to_worker_q = mp.Queue()
         self.from_enc_q = mp.Queue()
         self.helper_proc = mp.Process(
-            target=asr_helper_worker_proc,
+            target=_asr_helper_worker_proc_logged,   # ★ 带 fd 2 日志捕获
             args=(self.to_worker_q, self.from_enc_q, config),
             daemon=True,
         )
@@ -45,7 +103,10 @@ class QwenASREngine:
         self.embedding_table = llama.get_token_embeddings_gguf(llm_gguf, quiet=not self.verbose)
         self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=4096, embeddings=False)
 
-        msg = self.from_enc_q.get()
+        # ★ 原来是一句裸 get()：helper 一死就永久阻塞（不检查存活、也没有超时），
+        #   实测就是这样一路挂到外层的 600s 超时。改成轮询 + 存活检查 + 超时，
+        #   失败时把 helper 日志的尾巴一起报出来。
+        msg = self._wait_helper_ready()
         if msg.msg_type == MsgType.MSG_ERROR:
             raise RuntimeError(f"worker failed to start:\n\n{msg.data}")
         self.encoder_runtime = msg.data or {}
@@ -58,6 +119,54 @@ class QwenASREngine:
         self.ID_AUDIO_START = self.model.token_to_id("<|audio_start|>")
         self.ID_AUDIO_END = self.model.token_to_id("<|audio_end|>")
         self.ID_ASR_TEXT = self.model.token_to_id("<asr_text>")
+
+    def _wait_helper_ready(self) -> "StreamingMessage":
+        """等 helper 就绪消息；helper 死了/超时就立刻失败并带上它的日志尾部。"""
+        timeout = helper_ready_timeout_sec()
+        deadline = time.perf_counter() + timeout
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                self._terminate_helper()
+                raise TimeoutError(
+                    f"ASR helper 未在 {timeout:.0f}s 内就绪 "
+                    f"(log={helper_log_path()})\n--- helper log tail ---\n"
+                    + _helper_log_tail())
+            try:
+                return self.from_enc_q.get(timeout=max(0.01, min(0.2, remaining)))
+            except queue.Empty:
+                if not self.helper_proc.is_alive():
+                    raise RuntimeError(
+                        f"ASR helper 进程已退出 (exitcode={self.helper_proc.exitcode}, "
+                        f"log={helper_log_path()})\n--- helper log tail ---\n"
+                        + _helper_log_tail()) from None
+
+    def _get_from_helper(self, what: str = "encode result") -> "StreamingMessage":
+        """从 helper 收消息。**带存活检查**：helper 中途死掉时立刻失败并带上日志尾部，
+        而不是像原来那样无限期干等（编码阶段的两处 get() 原本都是裸的）。
+        不设总时长上限（编码本身可能很久），只关心"helper 还在不在"。"""
+        while True:
+            try:
+                return self.from_enc_q.get(timeout=0.2)
+            except queue.Empty:
+                proc = getattr(self, "helper_proc", None)
+                if proc is not None and not proc.is_alive():
+                    raise RuntimeError(
+                        f"ASR helper 进程已退出 (exitcode={proc.exitcode})，"
+                        f"等待 {what} 时终止。log={helper_log_path()}\n"
+                        "--- helper log tail ---\n" + _helper_log_tail()) from None
+
+    def _terminate_helper(self) -> None:
+        proc = getattr(self, "helper_proc", None)
+        if proc is None:
+            return
+        try:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+        self.helper_proc = None
 
     def shutdown(self) -> None:
         if self.helper_proc:
@@ -305,7 +414,7 @@ class QwenASREngine:
 
         for idx in range(num_chunks):
             t_wait_start = time.time()
-            msg = self.from_enc_q.get()
+            msg = self._get_from_helper(what=f"encode result {idx + 1}/{num_chunks}")
             stats["wait_time"] += time.time() - t_wait_start
             stats["encode_time"] += msg.encode_time
             audio_feature = msg.data
@@ -390,7 +499,7 @@ class QwenASREngine:
 
             t_wait_start = time.time()
             self.to_worker_q.put(StreamingMessage(MsgType.CMD_ENCODE, data=batch_audio))
-            msg = self.from_enc_q.get()
+            msg = self._get_from_helper(what="batch encode result")
             wait_time = time.time() - t_wait_start
             if msg.msg_type == MsgType.MSG_ERROR:
                 raise RuntimeError(msg.data)

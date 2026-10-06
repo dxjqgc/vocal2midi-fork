@@ -1,3 +1,4 @@
+import os
 import pathlib
 import sys
 import tempfile
@@ -123,7 +124,10 @@ def run_qwen_asr_and_fa(
         asr_model_path=asr_model_path,
         device=device,
         force_subprocess=True,
-        asr_timeout_sec=180,
+        # ★ 本仓库新增：超时改成可配。原来硬编码 180s —— worker 启动（spawn 子进程里
+        #   加载 Qwen ASR）冷启动就可能超过它，于是必然超时。默认放到 600s，
+        #   用 V2M_ASR_TIMEOUT_SEC 覆盖。
+        asr_timeout_sec=int(os.environ.get("V2M_ASR_TIMEOUT_SEC", "600")),
     )
     return process_asr_to_phonemes(
         all_results,
